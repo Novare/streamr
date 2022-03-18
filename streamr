@@ -1,0 +1,271 @@
+#!/usr/bin/python3
+
+from yt_dlp import YoutubeDL
+from pathlib import Path
+
+import os
+import time
+import pickle
+import signal
+import argparse
+from multiprocessing import Process
+import subprocess
+import curses
+
+def start_mpv(link):
+    subprocess.run(["mpv", "--no-video", "--loop", link], capture_output=True)
+
+def truncate_string(string, maxlength):
+    if len(string) > maxlength - 1:
+        return string[:maxlength - 1]
+    else:
+        return string
+
+def print_menu(stdscr):
+    # Clear screen
+    stdscr.clear()
+
+    # Create data list
+    data_dict = dict()
+    cfgfilepath = os.path.join(Path.home(), ".config/streamr/config.pickle")
+    if os.path.exists(cfgfilepath):
+        with open(cfgfilepath, "rb") as f:
+            data_dict = pickle.load(f)
+    else:
+        print("No links saved. Try using --add first.")
+        return
+    data_list = sorted(data_dict.items(), key=lambda x: str(x[1][0]).upper())
+
+    # Create selection and mpv output window
+    max_h, max_w = stdscr.getmaxyx()
+    stdscr.refresh()
+
+    mpv_win_h = 4
+    sel_win = curses.newwin(max_h - mpv_win_h, max_w, 0, 0)
+    mpv_win = curses.newwin(mpv_win_h, max_w, max_h - mpv_win_h, 0)
+    page_height = max_h - 2 - mpv_win_h 
+
+    sel_win.border()
+    mpv_win.border()
+
+    mpv_win.addstr(1, 1, truncate_string("Not playing anything.", max_w - 2))
+    mpv_win.addstr(2, 1, truncate_string("Press RIGHT or L (vim keys) to start streaming.", max_w - 2))
+
+    selection = 0
+    page = 0
+
+    for i, item in enumerate(data_list[:min(len(data_list), page_height)], start=0):
+        link = item[0]
+        title, channel, duration = item[1]
+
+        if i == selection:
+            sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2), curses.A_STANDOUT) 
+        else:
+            sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2)) 
+
+    sel_win.refresh()
+    mpv_win.refresh()
+
+    # Main update loop
+    up_keys = [curses.KEY_UP, ord("w"), ord("k")]
+    down_keys = [curses.KEY_DOWN, ord("s"), ord("j")]
+    modsel = selection % page_height
+
+    mpv_process = None
+
+    running = True
+    while running:
+        in_key = stdscr.getch()
+        modsel = selection % page_height
+
+        # Resize event
+        if in_key == curses.KEY_RESIZE:
+            # Redefine variables
+            max_h, max_w = stdscr.getmaxyx()
+            stdscr.refresh()
+
+            sel_win.resize(max_h - mpv_win_h, max_w)
+            mpv_win.resize(mpv_win_h, max_w)
+            mpv_win.mvwin(max_h - mpv_win_h, 0)
+            page_height = max_h - 2 - mpv_win_h 
+
+            # Redraw stream overview video
+            sel_win.erase()
+            sel_win.border()
+
+            pagemin = page * page_height
+            subdata_list = data_list[pagemin:min(len(data_list), pagemin + page_height)]
+            for i, item in enumerate(subdata_list, start=0):
+                link = item[0]
+                title, channel, duration = item[1]
+
+                if i == modsel:
+                    sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2), curses.A_STANDOUT) 
+                else:
+                    sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2)) 
+            sel_win.touchwin()
+            sel_win.refresh()
+
+            # Redraw player window
+            mpv_win.erase()
+            mpv_win.border()
+            if mpv_process is None:
+                mpv_win.addstr(1, 1, truncate_string("Not playing anything.", max_w - 2))
+                mpv_win.addstr(2, 1, truncate_string("Press RIGHT or L (vim keys) to start streaming.", max_w - 2))
+            else:
+                title, channel, duration = data_list[selection][1]
+                mpv_win.addstr(1, 1, truncate_string("♪ {} ♪".format(title), max_w - 2))
+                mpv_win.addstr(2, 1, truncate_string("You can press Q to stop or just select another stream.", max_w - 2))
+            mpv_win.refresh()
+
+        # If the user pressed up or down but we're already at the min or max selection, continue early
+        if in_key in up_keys and selection == 0:
+            continue
+        if in_key in down_keys and selection == len(data_list) - 1:
+            continue
+
+        # Are we going to flip the page? If so, redraw everything
+        do_upflip = (in_key in up_keys and selection > 0 and modsel == 0)
+        do_downflip = (in_key in down_keys and selection > 0 and modsel == page_height - 1)
+        if do_upflip or do_downflip:
+            sel_win.erase()
+            sel_win.border()
+            if in_key in up_keys:
+                page -= 1
+                selection -= 1
+            else:
+                page += 1
+                selection += 1
+            modsel = selection % page_height
+
+            pagemin = page * page_height
+            subdata_list = data_list[pagemin:min(len(data_list), pagemin + page_height)]
+
+            for i, item in enumerate(subdata_list, start=0):
+                link = item[0]
+                title, channel, duration = item[1]
+
+                if i == modsel:
+                    sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2), curses.A_STANDOUT) 
+                else:
+                    sel_win.addstr(1 + i, 1, truncate_string("{} ({})".format(title, duration), max_w - 2)) 
+            sel_win.touchwin()
+            sel_win.refresh()
+        else:
+            # Are we just changing the selection within a page? Then just do that
+            if in_key in up_keys:
+                # Redraw the old selection without the standout attribute
+                title, channel, duration = data_list[selection][1]
+                sel_win.addstr(1 + modsel, 1, " " * (max_w - 2)) 
+                sel_win.addstr(1 + modsel, 1, truncate_string("{} ({})".format(title, duration), max_w - 2)) 
+
+                # Update selection
+                selection -= 1
+                modsel = selection % page_height
+
+                # Redraw the new selection with the standout attribute
+                title, channel, duration = data_list[selection][1]
+                sel_win.addstr(1 + modsel, 1, " " * (max_w - 2)) 
+                sel_win.addstr(1 + modsel, 1, truncate_string("{} ({})".format(title, duration), max_w - 2), curses.A_STANDOUT) 
+                
+                # Refresh
+                sel_win.refresh()
+
+            if in_key in down_keys:
+                # Redraw the old selection without the standout attribute
+                title, channel, duration = data_list[selection][1]
+                sel_win.addstr(1 + modsel, 1, " " * (max_w - 2)) 
+                sel_win.addstr(1 + modsel, 1, truncate_string("{} ({})".format(title, duration), max_w - 2)) 
+
+                # Update selection
+                selection += 1
+                modsel = selection % page_height
+
+                # Redraw the new selection with the standout attribute
+                title, channel, duration = data_list[selection][1]
+                sel_win.addstr(1 + modsel, 1, " " * (max_w - 2)) 
+                sel_win.addstr(1 + modsel, 1, truncate_string("{} ({})".format(title, duration), max_w - 2), curses.A_STANDOUT) 
+                
+                # Refresh
+                sel_win.refresh()
+
+        if in_key == ord("l") or in_key == curses.KEY_RIGHT:
+            title, channel, duration = data_list[selection][1]
+            mpv_win.erase()
+            mpv_win.border()
+            mpv_win.addstr(1, 1, truncate_string("♪ {} ♪".format(title), max_w - 2))
+            mpv_win.addstr(2, 1, truncate_string("You can press Q to stop or just select another stream.", max_w - 2))
+            mpv_win.refresh()
+
+            if mpv_process is not None:
+                # Kill it
+                mpv_process.kill()
+            # Start a new one
+            link = str(data_list[selection][0])
+            mpv_process = Process(target=start_mpv, args=(link,))
+            mpv_process.start()
+
+        if in_key == ord("q"):
+            if mpv_process is not None:
+                mpv_win.erase()
+                mpv_win.border()
+                mpv_win.addstr(1, 1, truncate_string("Not playing anything.", max_w - 2))
+                mpv_win.addstr(2, 1, truncate_string("Press RIGHT or L (vim keys) to start streaming.", max_w - 2))
+                mpv_win.refresh()
+                mpv_process.kill()
+                mpv_process = None
+            else:
+                running = False
+
+def get_metadata(songlink):
+    with YoutubeDL({"quiet": True}) as ydl:
+        try:
+            result = ydl.extract_info(songlink, download=False)
+            result = ydl.sanitize_info(result)
+
+            title = str(result["title"])
+            channel = str(result["channel"])
+            duration = str(time.strftime("%H:%M:%S", time.gmtime(int(result["duration"]))))
+            return [songlink, title, channel, duration]
+        except Exception as e:
+            print("Warning! Video unavailable: {}. Skipping...".format(songlink))
+            print(e)
+            return []
+
+def add_link(ytlink):
+    homedir = Path.home()
+    cfgdir = os.path.join(homedir, ".config")
+    ytcfgdir = os.path.join(cfgdir, "streamr")
+    cfgfilepath = os.path.join(ytcfgdir, "config.pickle")
+
+    os.makedirs(cfgdir, exist_ok=True)
+    os.makedirs(ytcfgdir, exist_ok=True)
+
+    current_dict = dict()
+    if os.path.exists(cfgfilepath):
+        with open(cfgfilepath, "rb") as f:
+            current_dict = pickle.load(f)
+
+    metadata = get_metadata(ytlink) 
+    if len(metadata) == 4:
+        songlink, title, channel, duration = metadata
+        current_dict[songlink] = [title, channel, duration]
+
+        if os.path.exists(cfgfilepath):
+            os.remove(cfgfilepath)
+
+        with open(cfgfilepath, "wb") as f:
+            pickle.dump(current_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("Successfully added link to video '{}'".format(title))
+    else:
+        print("Failed to add link: {}".format(ytlink))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Play audio from YouTube-DL compatible sites.") 
+    parser.add_argument("--add", dest="link", nargs=1, type=str, help="Add a link")
+    args = parser.parse_args()
+
+    if args.link is not None and len(args.link) > 0:
+        add_link(args.link[0])
+    else:
+        curses.wrapper(print_menu)
